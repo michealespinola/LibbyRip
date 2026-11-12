@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-10-30
+// @version       2026-11-11.4
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -13,18 +13,40 @@
 // @run-at        document-start
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
 // @grant         none
-// @downloadURL https://update.greasyfork.org/scripts/498782/LibreGRAB.user.js
-// @updateURL https://update.greasyfork.org/scripts/498782/LibreGRAB.meta.js
+// @downloadURL none
+// @updateURL none
 // ==/UserScript==
 
-// Chrome (Tampermonkey/MV3) runs userscripts in an isolated JS world, meaning
-// overrides to JSON.parse and Function.prototype.bind never reach the page's
-// own execution context. The fix is to inject the main script body into the
-// real page world. client-zip is fetched here (where CSP does not apply to the
-// extension context) and injected into the page once it is ready.
+/* =========================================
+   CHANGE 00 | 2026-11-11 | MODIFICATION INDEX
+   Baseline: LibreGRAB_original.js, version 2026-10-30.
+   Baseline reviewed: LibreGRAB_fixed.js, version 2026-11-11.2.
+   CHANGE 15 adds standalone frame capture in version 2026-11-11.3.
+   Earlier CHANGE notes document the preceding compatibility work.
+
+   01 Version/update policy       08 Image-backed page styling
+   02 Private ZIP loader          09 EPUB 3 package metadata
+   03 Audio-only JSON capture     10 Language metadata handling
+   04 Archive status label        11 EPUB navigation document
+   05 Private chapter storage     12 Reader callback compatibility
+   06 Sequential chapter loading  13 Visible export errors
+   07 Frame-independent page IDs  14 Per-load UI identifiers
+
+   CURRENT DESIGN: CHANGE 15 supersedes the callback override.
+   Chapters are copied from loaded frames before the reader releases
+   them. No theme.js override or disabled downfall is required.
+   The detector hash list is currently a snapshot, not live discovery.
+
+   RETAINED: Original author/license, audiobook MP3 and ZIP options,
+   metadata/cover export, player URL capture, and FFmpeg processing.
+   Existing BEGIN/END section headings are preserved.
+   END CHANGE 00
+   ========================================= */
+// @author        michealespinola
+// @supportURL    https://github.com/michealespinola/LibbyRip/issues
 
 (function () {
-    function mainCode() {
+    function mainCode(privateNames) {
 
     // Since the ffmpeg.js file is 50mb, it slows the page down too much
     // to be in a "require" attribute, so we load it in async
@@ -46,29 +68,61 @@
 
     let downloadElem;
     let BIF;
+    /* =========================================
+       CHANGE 02 | 2026-11-11 | PRIVATE ZIP INITIALIZATION
+       Before: ZIP state and named resolver functions were on window.
+       Now: Cache the promise/function privately; use one random temporary
+       window callback to receive the library, then remove that callback.
+       The library is wrapped so downloadZip also stays private.
+       Added: HTTP checks, function validation, a 30-second timeout,
+       script-error handling, cleanup, and retry after a failed load.
+       Retained: client-zip 2.5.0 and lazy loading on first export.
+       Limit: Inline script execution still depends on page CSP.
+       END CHANGE 02
+       ========================================= */
+    let zipPromise;
     async function getDownloadZip() {
-        if (window.downloadZip) return window.downloadZip;
-        if (window.__libregrabClientZipReady) return window.__libregrabClientZipReady;
-        // Lazy: the client-zip promise must NOT exist at load. Creating it
-        // during parsing redirects the player to terms, so it is created
-        // only on first export use, long after the player initialized.
-        window.__libregrabClientZipReady = new Promise((resolve, reject) => {
-            window.__libregrabResolveClientZip = resolve;
-            window.__libregrabRejectClientZip = reject;
-        });
-        fetch('https://unpkg.com/client-zip@2.5.0/worker.js')
-            .then(r => r.text())
-            .then(clientZipCode => {
-                const tag = document.createElement('script');
-                tag.textContent = clientZipCode + ';\nwindow.__libregrabResolveClientZip?.(window.downloadZip);';
-                (document.documentElement || document.head || document.body).appendChild(tag);
-                tag.remove();
-            })
-            .catch(error => {
-                console.error('LibreGRAB: failed to load client-zip', error);
-                window.__libregrabRejectClientZip?.(new Error('client-zip failed to load'));
+        if (zipPromise) return zipPromise;
+        zipPromise = new Promise((resolve, reject) => {
+            const bridge = privateNames.zipBridge;
+            let timer;
+            let finished = false;
+            const finish = (error, zipFunction) => {
+                if (finished) return;
+                finished = true;
+                clearTimeout(timer);
+                delete window[bridge];
+                if (error) reject(error);
+                else resolve(zipFunction);
+            };
+            Object.defineProperty(window, bridge, {
+                configurable: true,
+                value: (zipFunction) => {
+                    if (typeof zipFunction !== 'function') {
+                        finish(new Error('ZIP library did not initialize'));
+                    } else finish(null, zipFunction);
+                }
             });
-        return window.__libregrabClientZipReady;
+            timer = setTimeout(() => finish(new Error(
+                'ZIP library did not load within 30 seconds; check Console for CSP errors'
+            )), 30000);
+            fetch('https://unpkg.com/client-zip@2.5.0/worker.js')
+                .then(response => {
+                    if (!response.ok) throw new Error(`ZIP library HTTP ${response.status}`);
+                    return response.text();
+                })
+                .then(code => {
+                    if (finished) return;
+                    const tag = document.createElement('script');
+                    tag.textContent = '(function(){' + code + '\n;window[' + JSON.stringify(bridge) + '](downloadZip);})();';
+                    tag.onerror = () => finish(new Error('ZIP library script was blocked'));
+                    (document.head || document.documentElement).appendChild(tag);
+                    tag.remove();
+                })
+                .catch(error => finish(error));
+        });
+        try { return await zipPromise; }
+        catch (error) { zipPromise = undefined; throw error; }
     }
     const CSS = `
     .pNav{
@@ -113,15 +167,27 @@
     // Libby, somewhere, gets the crypto stuff we need for mp3 urls, then removes it before adding it to the BIF.
     // here, we simply hook json parse to get it for us!
 
-    const old_parse = JSON.parse;
+    /* =========================================
+       CHANGE 03 | 2026-11-11 | LIMIT JSON CAPTURE TO AUDIO
+       Before: JSON.parse was replaced on every matching page; parsing
+       null could throw when the wrapper accessed ret["b"].
+       Now: Install the wrapper only on .listen. hosts, check for null,
+       and call the original parser with Reflect.apply.
+       Ebook pages keep their native JSON.parse. Audio still wraps it.
+       END CHANGE 03
+       ========================================= */
     let odreadCmptParams = null;
-    JSON.parse = function(...args){
-        let ret = old_parse(...args);
-        if (typeof(ret) == "object" && ret["b"] != undefined && ret["b"]["-odread-cmpt-params"] != undefined){
-            odreadCmptParams = Array.from(ret["b"]["-odread-cmpt-params"]);
-        }
-
-        return ret;
+    // Audio bootstrap capture is unnecessary on ebook pages.
+    if (location.hostname.includes('.listen.')) {
+        const oldParse = JSON.parse;
+        JSON.parse = function(...args) {
+            const result = Reflect.apply(oldParse, this, args);
+            if (result && typeof result === 'object' &&
+                result.b && result.b['-odread-cmpt-params'] != null) {
+                odreadCmptParams = Array.from(result.b['-odread-cmpt-params']);
+            }
+            return result;
+        };
     }
 
     // OverDrive stopped sending -odread-cmpt-params (upstream issue #82), so
@@ -572,7 +638,14 @@
 
         const zipBlob = await (await getDownloadZip())(files).blob();
 
-        downloadElem.innerHTML += "Generated zip file! <br>";
+        /* =========================================
+           CHANGE 04 | 2026-11-11 | FORMAT-NEUTRAL STATUS
+           Before: The shared fallback reported Generated zip file!
+           Now: Generated archive! applies to both ZIP and EPUB downloads.
+           The output filename/extension still comes from the calling path.
+           END CHANGE 04
+           ========================================= */
+        downloadElem.innerHTML += "Generated archive! <br>";
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
         const downloadUrl = URL.createObjectURL(zipBlob);
@@ -724,45 +797,142 @@
            <a class="pLink" id="download"> <h1> Download EPUB </h1> </a>
         </div>
     `;
-    const pages = window.pages = {};
+    /* =========================================
+       CHANGE 05 | 2026-11-11 | PRIVATE CHAPTER COLLECTION
+       Before: The collection was also exposed as window.pages.
+       Now: Use a private object without a prototype; all collection
+       reads and writes were updated to reference this local variable.
+       Removed: The global Function.prototype.bind hook and its heuristic
+       decryption-function global. CHANGE 15 now reads loaded frames
+       instead of obtaining a decoding callback.
+       Old Console diagnostics using window.pages no longer apply.
+       END CHANGE 05
+       ========================================= */
+    const pages = Object.create(null);
 
-    // Libby used the bind method as a way to "safely" expose
-    // the decryption module. THIS IS THEIR DOWNFALL.
-    // As we can hook bind, allowing us to obtain the
-    // decryption function
-    const originalBind = Function.prototype.bind;
-    Function.prototype.bind = function(...args) {
-        const boundFn = originalBind.apply(this, args);
+    // Loaded-frame capture requires no callback replacement or global bind patch.
 
-        // Store bound arguments (excluding `this`) for potential decryption function
-        boundFn.__boundArgs = args.slice(1);
-
-        // Also store the original function for debugging
-        boundFn.__originalFunction = this;
-
-        // If this looks like a decryption function, store it globally
-        if (this.toString().includes('decryption') ||
-            args.some(arg => typeof arg === 'function' && arg.toString().includes('decryption'))) {
-            console.log("Decryption function detected:", this);
-            window.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
+    /* =========================================
+       CHANGE 06 | 2026-11-11 | SEQUENTIAL CHAPTER LOADING
+       Before: Called private _loadContent with no work token for every
+       chapter, then polled forever and repeatedly logged missing counts.
+       Now: Skip captured chapters; halt stale work, fetch one chapter,
+       copy the loaded frame before release, then advance to the next.
+       Added: A 30-second timeout per chapter and explicit failure paths.
+       Why: Avoid invalid work-token failures and indefinite waiting.
+       Limit: halt/fetch still use reader internals. Avoid navigating
+       the reader during export, as navigation can start competing work.
+       END CHANGE 06
+       ========================================= */
+    /* =========================================
+       CHANGE 15 | 2026-11-11 | NO-OVERRIDE FRAME CAPTURE
+       Before: Replace a locked chapter callback using Local Overrides.
+       Now: Let the reader decode normally; copy its loaded document
+       inside fetch() completion, before fetch() releases the frame.
+       Store base URLs and stylesheet URLs with each captured chapter.
+       Existing loaded frames are copied without forcing another load.
+       Only cloned markup is sanitized; the live reader is not edited.
+       Limits: Needs a readable same-origin frame and the current
+       component fetch() lifecycle. This is not yet live-browser tested.
+       ========================================= */
+    const pageResources = Object.create(null);
+    function captureLoadedChapter(component) {
+        const frame = component.frameBox || component.sheetBox?.querySelector('iframe');
+        const doc = frame?.contentDocument;
+        if (!doc?.body || !doc.documentElement) {
+            throw new Error(`Chapter frame is unavailable: ${component.id}`);
         }
-
-        return boundFn;
-    };
-
-
-    async function waitForChapters(callback){
-        let components = getBookComponents();
-        // Force all the chapters to load in.
-        components.forEach(page =>{
-            if (undefined != window.pages[page.id]) return;
-            page._loadContent({callback: ()=>{}})
+        // CHANGE 16: The reader marks successful documents as "ok".
+        // Attribute presence alone does not indicate a loading failure.
+        const documentStatus = doc.documentElement
+            .getAttribute('data-document-status');
+        if (documentStatus && documentStatus.trim().toLowerCase() !== 'ok') {
+            throw new Error(`Reader reported ${documentStatus} for ${component.id}`);
+        }
+        const base = [doc.baseURI, frame.src].find(value => /^https?:/i.test(value || '')) ||
+            new URL(component.meta.path, location.href).href;
+        const root = doc.documentElement.cloneNode(true);
+        root.querySelectorAll('script, base').forEach(node => node.remove());
+        root.querySelectorAll('*').forEach(element => {
+            for (const attribute of Array.from(element.attributes)) {
+                if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
+            }
         });
-        // But its not instant, so we need to wait until they are all set (see: bifFound())
-        while (components.filter((page)=>undefined==window.pages[page.id]).length){
-            await new Promise(r => setTimeout(r, 100));
+        const links = Array.from(doc.querySelectorAll('link[rel~="stylesheet"][href]'))
+            .map(link => new URL(link.getAttribute('href'), base).href);
+        root.querySelectorAll('link[rel~="stylesheet"]').forEach(link => link.remove());
+        root.querySelectorAll('img[src], image').forEach(image => {
+            for (const attribute of ['src', 'href', 'xlink:href']) {
+                const value = image.getAttribute(attribute);
+                if (value && !value.startsWith('#')) {
+                    image.setAttribute(attribute, new URL(value, base).href);
+                }
+            }
+        });
+        const body = root.querySelector('body');
+        if (!body || (!body.textContent.trim() && !body.querySelector('img, image, svg, canvas'))) {
+            throw new Error(`Chapter frame has no readable content: ${component.id}`);
+        }
+        if (body.querySelector('canvas')) {
+            throw new Error(`Chapter uses canvas rendering; export is unsupported: ${component.id}`);
+        }
+        pageResources[component.id] = {base, links};
+        // fixXhtml supplies the outer html element; preserve head and body.
+        pages[component.id] = (root.querySelector('head')?.outerHTML || '') + body.outerHTML;
+    }
+
+    async function waitForChapters(callback) {
+        const components = getBookComponents();
+
+        for (const component of components) {
+            if (pages[component.id] !== undefined) {
+                callback();
+                continue;
+            }
+
+            if (component.isLoaded()) {
+                captureLoadedChapter(component);
+                callback();
+                continue;
+            }
+            // Clear stale work before beginning this sequential load.
+            component.halt();
+
+            await new Promise((resolve, reject) => {
+                let settled = false;
+
+                const finish = (error) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+
+                    if (error) reject(error);
+                    else resolve();
+                };
+
+                const timer = setTimeout(() => {
+                    finish(new Error(
+                        `Chapter loading timed out: ${component.id}\n` +
+                        `Stage: ${component._?.loadingStage || "unknown"}`
+                    ));
+                }, 30000);
+
+                try {
+                    component.fetch(() => {
+                        if (settled) return;
+                        try {
+                            captureLoadedChapter(component);
+                            finish();
+                        } catch (error) {
+                            finish(error);
+                        }
+                    });
+                } catch (error) {
+                    finish(error);
+                }
+            });
+
             callback();
-            console.log(components.filter((page)=>undefined==window.pages[page.id]).length);
         }
     }
     function getBookComponents(){
@@ -796,41 +966,30 @@
         let gc = 0;
         await waitForChapters(()=>{
             gc+=1;
-            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=window.pages[page.id]).length}/${totComp}`;
+            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=pages[page.id]).length}/${totComp}`;
         });
 
         downloadElem.innerHTML += `Chapter gathering complete<br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        let idToIfram = {};
-        let idToMetaId = {};
-        components.forEach(c=>{
-            // Nothing that can be done here...
-            if (c.sheetBox.querySelector("iframe") == null){
-                console.warn("!!!" + window.pages[c.id]);
-                return;
+        /* =========================================
+           CHANGE 07 / 15 | CAPTURED PAGE RESOURCES
+           IDs, base URLs and stylesheet references no longer depend
+           on reader frames surviving until the packaging stage.
+           ========================================= */
+        for (const component of components) {
+            component.meta.id = component.meta.id || crypto.randomUUID();
+            const resource = pageResources[component.id];
+            if (!resource || pages[component.id] === undefined) {
+                throw new Error(`Missing captured chapter: ${component.id}`);
             }
-            c.meta.id = c.meta.id || crypto.randomUUID()
-            idToMetaId[c.id] = c.meta.id;
-            idToIfram[c.id] = c.sheetBox.querySelector("iframe");
-
-            c.sheetBox.querySelector("iframe").contentWindow.document.querySelectorAll("link").forEach(link=>{
-                cssRegistry[c.id] = cssRegistry[c.id] || [];
-                cssRegistry[c.id].push(link.href);
-
-                if (imgAssests.includes(link.href)) return;
-                imgAssests.push(link.href);
-
-
-            });
-        });
-        let url = location.origin;
-        for (let i of Object.keys(window.pages)){
-            if (idToIfram[i])
-                url = idToIfram[i].src;
+            for (const href of resource.links) {
+                if (!imgAssests.includes(href)) imgAssests.push(href);
+            }
             files.push({
-                name: "OEBPS/" + truncate(i),
-                input: fixXhtml(idToMetaId[i], url, window.pages[i], imgAssests, cssRegistry[i] || [])
+                name: "OEBPS/" + truncate(component.id),
+                input: fixXhtml(component.meta.id, resource.base,
+                    pages[component.id], imgAssests, resource.links)
             });
         }
 
@@ -857,12 +1016,26 @@
             downloadElem.querySelector("span#assetGath").innerHTML = ` ${gc}/${imgAssests.length} `;
         })()));
     }
+    /* =========================================
+       CHANGE 08 | 2026-11-11 | IMAGE AND TEXT OVERLAY LAYOUT
+       Added: Inline positioning and transparent text-overlay styling,
+       plus viewport dimensions taken from the page image.
+       Applied only to markup containing .imageLayer img and .textLayer.
+       Why: Without CSS, overlay text flowed as extra visible text after
+       the image. Keep the overlay rather than deleting its text.
+       Missing/invalid image dimensions now raise an explicit error.
+       Limit: This is a format-specific repair, not a general recreation
+       of arbitrary publisher CSS or fonts.
+       END CHANGE 08
+       ========================================= */
+    const CSS_FIXED_PAGES = 'html, body { margin:0; padding:0; overflow:hidden; }\nbody { position:relative; }\n.imageLayer, .textLayer { position:absolute; left:0; top:0; width:100%; height:100%; }\n.imageLayer img { display:block; width:100%; height:100%; }\n.textLayer { overflow:hidden; line-height:1; direction:ltr; }\n.textLayer > span { position:absolute; color:transparent !important; white-space:pre; transform-origin:0% 0%; }\n.textLayer > br { display:none; }\n';
+
     function enforceEpubXHTML(metaId, url, htmlString, assetRegistry, links) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(htmlString, 'text/html');
         const bod = doc.querySelector("body");
         if (bod){
-            bod.setAttribute("id", metaId);
+            if (metaId) bod.setAttribute("id", metaId);
         }
 
         // Convert all elements to lowercase tag names
@@ -929,6 +1102,24 @@
             head.appendChild(linkElement);
         }
 
+        // Image-backed fixed pages contain a transparent text overlay.
+        // Recreate its styling from captured markup, not discarded reader frames.
+        const pageImage = doc.querySelector('.imageLayer img');
+        if (pageImage && doc.querySelector('.textLayer')) {
+            const width = Number(pageImage.getAttribute('width'));
+            const height = Number(pageImage.getAttribute('height'));
+            if (!(width > 0 && height > 0)) {
+                throw new Error('Missing dimensions for image-backed page');
+            }
+            const viewport = doc.createElement('meta');
+            viewport.name = 'viewport';
+            viewport.content = `width=${width}, height=${height}`;
+            head.appendChild(viewport);
+            const style = doc.createElement('style');
+            style.textContent = CSS_FIXED_PAGES;
+            head.appendChild(style);
+        }
+
         // Get the serialized XHTML string
         const serializer = new XMLSerializer();
         let xhtmlString = serializer.serializeToString(doc);
@@ -979,8 +1170,19 @@
         );
 
         // Step 2: Set attributes for the root element
+        /* =========================================
+           CHANGE 09 | 2026-11-11 | EPUB 3 AND FIXED-LAYOUT METADATA
+           Before: Declared EPUB 2.0 with no fixed-layout declaration.
+           Now: Declare EPUB 3.0 and the rendition vocabulary; add a UTC
+           modified timestamp. If every selected component has both layer
+           markers, declare pre-paginated layout and disable spreads.
+           The existing NCX is retained alongside the new EPUB navigation.
+           This change alone is not proof of full EPUB specification validity.
+           END CHANGE 09
+           ========================================= */
         const packageElement = doc.documentElement;
-        packageElement.setAttribute('version', '2.0');
+        packageElement.setAttribute('version', '3.0');
+        packageElement.setAttribute('prefix', 'rendition: http://www.idpf.org/vocab/rendition/#');
         packageElement.setAttribute('xml:lang', 'en');
         packageElement.setAttribute('unique-identifier', 'pub-identifier');
         packageElement.setAttribute('xmlns', 'http://www.idpf.org/2007/opf');
@@ -997,13 +1199,36 @@
         dcIdentifier.setAttribute('id', 'pub-identifier');
         dcIdentifier.textContent = "" + BIF.map["-odread-buid"];
         metadata.appendChild(dcIdentifier);
+        const fixedPages = getBookComponents().every(c => {
+            const raw = pages[c.id] || '';
+            return raw.includes('imageLayer') && raw.includes('textLayer');
+        });
+        const metadataValues = {'dcterms:modified': new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')};
+        if (fixedPages) {
+            metadataValues['rendition:layout'] = 'pre-paginated';
+            metadataValues['rendition:spread'] = 'none';
+        }
+        for (const [property, value] of Object.entries(metadataValues)) {
+            const meta = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            meta.setAttribute('property', property);
+            meta.textContent = value;
+            metadata.appendChild(meta);
+        }
 
+
+        /* =========================================
+           CHANGE 10 | 2026-11-11 | PRESERVE FULL LANGUAGE VALUE
+           Before: Always used language[0], turning a string like en into e.
+           Now: Take the first item for arrays, or use the full string.
+           Use that same value for package xml:lang.
+           END CHANGE 10
+           ========================================= */
         // Language
         if (BIF.map.language.length){
             const dcLanguage = doc.createElementNS('http://purl.org/dc/elements/1.1/', 'dc:language');
             dcLanguage.setAttribute('xsi:type', 'dcterms:RFC4646');
-            dcLanguage.textContent = BIF.map.language[0];
-            packageElement.setAttribute('xml:lang', BIF.map.language[0]);
+            dcLanguage.textContent = Array.isArray(BIF.map.language) ? BIF.map.language[0] : BIF.map.language;
+            packageElement.setAttribute('xml:lang', dcLanguage.textContent);
             metadata.appendChild(dcLanguage);
         }
 
@@ -1090,6 +1315,43 @@
             item.setAttribute('media-type', getMimeTypeFromFileName(aname));
             manifest.appendChild(item);
         });
+
+        /* =========================================
+           CHANGE 11 | 2026-11-11 | EPUB NAVIGATION DOCUMENT
+           Added: OEBPS/nav.xhtml, registered with properties="nav".
+           Its entries follow component order and use Page N labels.
+           The older toc.ncx generation remains unchanged.
+           Limit: The added navigation is a flat page list; it does not
+           reconstruct the original chapter-title hierarchy.
+           END CHANGE 11
+           ========================================= */
+        const navDoc = document.implementation.createDocument('http://www.w3.org/1999/xhtml', 'html');
+        const ns = 'http://www.w3.org/1999/xhtml';
+        const navHead = navDoc.createElementNS(ns, 'head');
+        const navTitle = navDoc.createElementNS(ns, 'title');
+        navTitle.textContent = 'Contents';
+        navHead.appendChild(navTitle);
+        navDoc.documentElement.appendChild(navHead);
+        const navBody = navDoc.createElementNS(ns, 'body');
+        const nav = navDoc.createElementNS(ns, 'nav');
+        nav.setAttributeNS('http://www.idpf.org/2007/ops', 'epub:type', 'toc');
+        const list = navDoc.createElementNS(ns, 'ol');
+        components.forEach((component, index) => {
+            const li = navDoc.createElementNS(ns, 'li');
+            const a = navDoc.createElementNS(ns, 'a');
+            a.setAttribute('href', truncate(component.meta.path));
+            a.textContent = `Page ${index + 1}`;
+            li.appendChild(a); list.appendChild(li);
+        });
+        nav.appendChild(list); navBody.appendChild(nav);
+        navDoc.documentElement.appendChild(navBody);
+        files.push({name:'OEBPS/nav.xhtml', input:new XMLSerializer().serializeToString(navDoc)});
+        const navItem = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
+        navItem.setAttribute('id','epub-nav');
+        navItem.setAttribute('href','nav.xhtml');
+        navItem.setAttribute('media-type','application/xhtml+xml');
+        navItem.setAttribute('properties','nav');
+        manifest.appendChild(navItem);
 
         // Step 5: Serialize the document to a string
         const serializer = new XMLSerializer();
@@ -1246,6 +1508,12 @@
         downloadState = -1;
     }
 
+    /* =========================================
+       CHANGE 12 | 2026-11-11 | EBOOK INITIALIZATION
+       The previous version intercepted __bif_cfc3 through an external
+       theme.js override. CHANGE 15 removes that requirement entirely.
+       Startup now adds the UI without touching any reader callback.
+       ========================================= */
     // Main entry point for books
     function bifFoundBook(){
         // New global style info
@@ -1253,42 +1521,7 @@
         s.innerHTML = CSS;
         document.head.appendChild(s)
 
-        if (!window.__bif_cfc1){
-            alert("Injection failed! __bif_cfc1 not found");
-            return;
-        }
-
-        // Debug: Log the original function structure
-        console.log("Original __bif_cfc1:", window.__bif_cfc1);
-        console.log("__bif_cfc1.__boundArgs:", window.__bif_cfc1.__boundArgs);
-        const old_crf1 = window.__bif_cfc1;
-        window.__bif_cfc1 = (win, edata)=>{
-            // If the bind hook succeeds, then the first element of bound args
-            // will be the decryption function. So we just passivly build up an
-            // index of the pages!
-            if (old_crf1.__boundArgs && old_crf1.__boundArgs[0]) {
-                pages[win.name] = old_crf1.__boundArgs[0](edata);
-            } else {
-                console.warn("Bind args not found, trying alternative decryption method");
-                // Try global decryption function if available
-                if (window.__libregrab_decryption_fn) {
-                    try {
-                        pages[win.name] = window.__libregrab_decryption_fn(edata);
-                    } catch (error) {
-                        console.error("Global decryption function failed:", error);
-                    }
-                }
-                // Final fallback: try to extract decrypted content directly
-                try {
-                    pages[win.name] = old_crf1(win, edata);
-                } catch (error) {
-                    console.error("Failed to decrypt content:", error);
-                    console.log("Attempting raw edata extraction");
-                    pages[win.name] = edata; // Sometimes the edata is already decrypted
-                }
-            }
-            return old_crf1(win, edata);
-        };
+        console.info('LibreGRAB: loaded-frame export ready');
 
         buildBookPirateUi();
     }
@@ -1301,7 +1534,23 @@
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting download</b><br>";
 
-        downloadEPUB().then(()=>{});
+        /* =========================================
+           CHANGE 13 | 2026-11-11 | SHOW EXPORT FAILURES
+           Before: No rejection handler on the EPUB export promise.
+           Now: Log the error, show it as text in the download panel, and
+           reset downloadState so the user can attempt another export.
+           END CHANGE 13
+           ========================================= */
+        downloadEPUB().catch(error => {
+            console.error("LibreGRAB: download failed", error);
+
+            const message = document.createElement("pre");
+            message.style.whiteSpace = "pre-wrap";
+            message.textContent = error.message || String(error);
+            downloadElem.appendChild(message);
+
+            downloadState = -1;
+        });
     }
     function buildBookPirateUi(){
         // Create the nav
@@ -1370,6 +1619,50 @@
         script.remove();
     }
 
-    injectPageScript(`(${mainCode.toString()})();`);
+    /* =========================================
+       CHANGE 14 | 2026-11-11 | PER-LOAD UI NAMES AND HASH CHECKS
+       Before: UI class/ID markers used stable names on the page.
+       Now: Generate 128-bit random suffixes and reject duplicates,
+       existing window property names, and known detector-hash matches.
+       Rewrite the eight listed UI tokens consistently in the main
+       function source before injecting it; also generate the ZIP bridge.
+       CSS strings, HTML strings, and selectors share the same mapping.
+       The mapping remains private. Reader API names are not renamed.
+       Limit: reservedHashes is the inspected detector snapshot. This
+       does not fetch or decode updated detector code automatically,
+       randomize every DOM identifier, or guarantee future non-detection.
+       END CHANGE 14
+       ========================================= */
+    // Generate CSS-safe, per-load names. No name map is exposed on window.
+    const reservedHashes = new Set([
+        2884670943, 3715490804, 1042643420, 3879434267,
+        2174135392, 1753812077, 767634082, 3553780316,
+        199939980, 1202545083, 3798819573, 4213409763
+    ]);
+    function hashName(value) {
+        let hash = 2166136261;
+        for (let i = 0; i < value.length; i++) {
+            hash = Math.imul(hash ^ value.charCodeAt(i), 16777619) >>> 0;
+        }
+        return hash;
+    }
+    const used = new Set();
+    function freshName() {
+        let name;
+        do {
+            const bytes = crypto.getRandomValues(new Uint8Array(16));
+            name = 'lg_' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        } while (used.has(name) || name in window || reservedHashes.has(hashName(name)));
+        used.add(name);
+        return name;
+    }
+    const tokens = ['pNav', 'pLink', 'foldMenu', 'dumpAll',
+        'mp3Progress', 'sweepAcc', 'chapAcc', 'assetGath'];
+    const names = Object.fromEntries(tokens.map(token => [token, freshName()]));
+    const privateNames = {zipBridge: freshName()};
+    // These tokens occur only in our UI strings/selectors, not reader APIs.
+    const tokenPattern = new RegExp('\\b(' + tokens.join('|') + ')\\b', 'g');
+    const source = mainCode.toString().replace(tokenPattern, token => names[token]);
+    injectPageScript(`(${source})(${JSON.stringify(privateNames)});`);
 
 })();
