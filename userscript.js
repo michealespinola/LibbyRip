@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-11-11.4
+// @version       2026-11-12.3
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -335,7 +335,19 @@
         };
     }
     function getAuthorString(){
-        return BIF.map.creator.filter(creator => creator.role === 'author').map(creator => creator.name).join(", ");
+        return (Array.isArray(BIF.map.creator) ? BIF.map.creator : [])
+            .filter(creator => creator && creator.role === "author" && creator.name)
+            .map(creator => creator.name).join(", ");
+    }
+
+    // CHANGE 19: Use one Windows-safe archive filename convention.
+    function getArchiveFilename(extension) {
+        const author = getAuthorString().trim() || "Unknown author";
+        const title = String(BIF.map.title?.main || "Untitled").trim() || "Untitled";
+        const name = (author + " - " + title)
+            .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+            .replace(/[. ]+$/, "");
+        return name + "." + extension;
     }
 
     function getMetadata(){
@@ -552,60 +564,127 @@
         return ffmpegInitPromise;
     }
 
-    // Fill in any chapter URLs the player has not provided yet by driving the
-    // player itself through the missing parts: seeking to a part makes the
-    // player set that part's working URL on its audio element, which the
-    // capture hook records. No manual seeking needed. Parts whose URLs
-    // already carry a query are left alone, so players with working params
-    // (e.g. Libby) are untouched. The original position is always restored.
-    function hasWorkingUrl(u){
-        return /\?.+=/.test(u.url);
+    /* CHANGE 18 | BACKGROUND AUDIO URL COLLECTION
+       Collect assigned media URLs as well as completed resource entries.
+       Inspect a bounded reader-object graph for detached Audio elements;
+       do not patch browser media prototypes or change tab visibility.
+       Retry missing parts with elapsed-time deadlines in every tab state.
+       Keep observers private and remove them when collection ends.
+    */
+    function hasWorkingUrl(u) {
+        return !!u && /\?.+=/.test(u.url);
     }
-    async function ensurePlayerUrls(urls){
-        mergePerformanceMediaUrls();
-        urls = getUrls();
-        let missing = urls.filter(function(u){ return !hasWorkingUrl(u); });
-        if (!missing.length) return getUrls();
-        let spool = BIF.objects && BIF.objects.spool;
-        let compass = BIF.objects && BIF.objects.compass;
-        if (!spool || !compass || typeof compass.at !== "function") return getUrls();
-        let origFloc = spool.focus ? spool.focus.floc : 0;
-        downloadElem.innerHTML += "Gathering audio <span id=\"sweepAcc\"></span><br>";
-        try {
-            for (let i = 0; i < missing.length; i++) {
-                let u = missing[i];
-                let sweepSpan = downloadElem.querySelector("span#sweepAcc"); if (sweepSpan) sweepSpan.textContent = "part " + (u.index + 1) + " of " + urls.length + "…";
-                try {
-                    let fracUsed = (u.index === urls.length - 1) ? (0.25 + Math.random() * 0.5) : (0.01 + Math.random() * 0.98); let place = compass.at({ floc: u.index + fracUsed });
-                    if (place && typeof place.seek === "function") place.seek();
-                } catch (e) {}
-                let waited = 0;
-                while (waited < 2000) {
-                    mergePerformanceMediaUrls();
-                    if (hasWorkingUrl(getUrls().filter(function(x){ return x.index === u.index; })[0] || u)) break;
-                    await new Promise(function(r){ setTimeout(r, 100); });
-                    waited += 100;
-                }
-                if (i < missing.length - 1) {
-                    await new Promise(function(r){ setTimeout(r, 400 + Math.random() * 1200); });
-                }
-            }
-            let settled = 0;
-            while (settled < 20000) {
-                mergePerformanceMediaUrls();
-                if (!getUrls().filter(function(x){ return !hasWorkingUrl(x); }).length) break;
-                await new Promise(function(r){ setTimeout(r, 500); });
-                settled += 500;
-            }
-        } finally {
+
+    async function ensurePlayerUrls(urls) {
+        const spool = BIF.objects?.spool;
+        const compass = BIF.objects?.compass;
+        const expected = new Set((spool?.components || []).map(component =>
+            partKeyFromUrl(component.meta.path)));
+        function collectUrl(value) {
             try {
-                let back = compass.at({ floc: origFloc });
-                if (back && typeof back.seek === "function") back.seek();
-            } catch (e) {}
-            let sweepDone = downloadElem.querySelector("span#sweepAcc"); if (sweepDone) sweepDone.textContent = "complete";
+                if (typeof value !== "string") return;
+                const url = new URL(value, location.href);
+                if (!/^https?:$/.test(url.protocol) ||
+                    !expected.has(partKeyFromUrl(url.href)) ||
+                    !hasWorkingUrl({url: url.href})) return;
+                // Replace stale entries with the player's latest assigned URL.
+                capturedPlayerUrls.set(partKeyFromUrl(url.href), url.href);
+            } catch (error) { /* Not a usable media URL. */ }
         }
-        mergePerformanceMediaUrls();
-        return getUrls();
+        function collectResources(entries) {
+            for (const entry of entries) collectUrl(entry.name);
+        }
+        function collectAssignedUrls() {
+            // This also sees requests whose timing entries have not completed.
+            const queue = [{value: spool, depth: 0},
+                {value: BIF.objects?.audioManager, depth: 0}];
+            for (const element of document.querySelectorAll("audio, video")) {
+                collectUrl(element.src);
+                collectUrl(element.currentSrc);
+            }
+            const seen = new Set();
+            for (let i = 0; i < queue.length && i < 300; i++) {
+                const {value, depth} = queue[i];
+                if (!value || typeof value !== "object" || seen.has(value)) continue;
+                seen.add(value);
+                if (value instanceof HTMLMediaElement) {
+                    collectUrl(value.src);
+                    collectUrl(value.currentSrc);
+                    continue;
+                }
+                if (value instanceof Node || value === window || depth > 6) continue;
+                try {
+                    // Data descriptors only: do not invoke arbitrary getters.
+                    for (const descriptor of Object.values(
+                        Object.getOwnPropertyDescriptors(value))) {
+                        const child = descriptor.value;
+                        if (typeof child === "string") collectUrl(child);
+                        else if (child && typeof child === "object" &&
+                            queue.length < 300) {
+                            queue.push({value: child, depth: depth + 1});
+                        }
+                    }
+                } catch (error) { /* An inaccessible reader object is optional. */ }
+            }
+        }
+        function collect() {
+            collectResources(performance.getEntriesByType("resource") || []);
+            collectAssignedUrls();
+            return getUrls();
+        }
+        urls = collect();
+        if (urls.every(hasWorkingUrl)) return urls;
+        if (!spool || !compass || typeof compass.at !== "function") return urls;
+
+        const origFloc = spool.focus ? spool.focus.floc : 0;
+        let observer;
+        downloadElem.innerHTML += "Gathering audio <span id=\"sweepAcc\"></span><br>";
+        const status = downloadElem.querySelector("span#sweepAcc");
+        try {
+            if (typeof PerformanceObserver === "function") {
+                try {
+                    observer = new PerformanceObserver(list =>
+                        collectResources(list.getEntries()));
+                    observer.observe({type: "resource", buffered: true});
+                } catch (error) { observer?.disconnect(); }
+            }
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                const missing = collect().filter(item => !hasWorkingUrl(item));
+                if (!missing.length) break;
+                for (const part of missing) {
+                    if (hasWorkingUrl(collect().find(item => item.index === part.index))) continue;
+                    if (status) status.textContent =
+                        `part ${part.index + 1} of ${urls.length}, attempt ${attempt}/3`;
+                    const place = compass.at({floc: part.index +
+                        [0.25, 0.5, 0.75][attempt - 1]});
+                    if (!place || typeof place.seek !== "function") continue;
+                    place.seek();
+                    // Poll actual elapsed time; never depend on a fixed number
+                    // of timer ticks or require the tab to become visible.
+                    const deadline = performance.now() + 30000;
+                    do {
+                        if (hasWorkingUrl(collect().find(item => item.index === part.index))) break;
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    } while (performance.now() < deadline);
+                }
+            }
+            urls = collect();
+        } finally {
+            if (observer) {
+                collectResources(observer.takeRecords());
+                observer.disconnect();
+            }
+            urls = collect();
+            const missing = urls.filter(item => !hasWorkingUrl(item));
+            if (status) status.textContent = missing.length
+                ? "incomplete; missing part(s) " + missing.map(item => item.index + 1).join(", ")
+                : "complete";
+            try {
+                const back = compass.at({floc: origFloc});
+                if (back && typeof back.seek === "function") back.seek();
+            } catch (error) { /* Do not mask the export result. */ }
+        }
+        return urls;
     }
 
     function exportMP3(){
@@ -631,9 +710,9 @@
 
 
 
-    // Helper function for fallback blob download (older browsers)
+    // CHANGE 19: Always use browser downloads; no script-created save dialog.
     async function fallbackBlobDownload(files, filename) {
-        downloadElem.innerHTML += "Using fallback download method...<br>";
+        downloadElem.innerHTML += "Preparing browser download...<br>";
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
         const zipBlob = await (await getDownloadZip())(files).blob();
@@ -697,44 +776,10 @@
         downloadElem.innerHTML += "<br><b>Downloads complete!</b> Starting ZIP generation and download...<br>";
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        const filename = getAuthorString() + ' - ' + BIF.map.title.main + '.zip';
+        const filename = getArchiveFilename("zip");
 
-        // Try using File System Access API for streaming (much faster)
-        if ('showSaveFilePicker' in window) {
-            try {
-                const handle = await window.showSaveFilePicker({
-                    suggestedName: filename,
-                    types: [{
-                        description: 'ZIP Archive',
-                        accept: {'application/zip': ['.zip']},
-                    }],
-                });
-
-                downloadElem.innerHTML += "Streaming ZIP file to disk...<br>";
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-
-                const writable = await handle.createWritable();
-                const zipStream = (await getDownloadZip())(files).body;
-
-                await zipStream.pipeTo(writable);
-
-                downloadElem.innerHTML += "Download complete!<br>";
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-            } catch (err) {
-                if (err.name === 'AbortError') {
-                    // User cancelled the save dialog
-                    downloadElem.innerHTML += "Download cancelled by user.<br>";
-                } else {
-                    console.error('Streaming download failed:', err);
-                    downloadElem.innerHTML += "Streaming failed, using fallback...<br>";
-                    // Fall back to blob method
-                    await fallbackBlobDownload(files, filename);
-                }
-            }
-        } else {
-            // Fall back to blob method for older browsers
-            await fallbackBlobDownload(files, filename);
-        }
+        // Browser settings control the destination and any browser-level prompt.
+        await fallbackBlobDownload(files, filename);
 
         downloadState = -1;
         downloadElem.innerHTML = ""
@@ -900,6 +945,61 @@
 
             await new Promise((resolve, reject) => {
                 let settled = false;
+                let lastStage = component._?.loadingStage;
+                let lastProgress = performance.now();
+                let wasHidden = document.hidden;
+                let timer;
+
+                // CHANGE 17: Continue exports in hidden tabs. The inspected
+                // reader waits for fonts.ready after loading/modifying markup.
+                // Export needs that markup, not completed visual font layout.
+                // Capture only at that exact stage, with a complete, healthy
+                // document. Never synthesize reader completion callbacks.
+                const checkProgress = () => {
+                    if (settled) return;
+                    const stage = component._?.loadingStage;
+                    const now = performance.now();
+                    if (stage !== lastStage) {
+                        lastStage = stage;
+                        lastProgress = now;
+                    }
+                    // Give foreground work a fresh budget on return, rather
+                    // than immediately expiring a background operation.
+                    if (wasHidden && !document.hidden) lastProgress = now;
+                    wasHidden = document.hidden;
+                    if (document.hidden &&
+                        stage === "waiting for fonts.ready promise to fulfill") {
+                        try {
+                            const doc = component.frameBox?.contentDocument;
+                            if (doc?.readyState === "complete" &&
+                                doc.documentElement?.getAttribute(
+                                    "data-document-status") === "ok") {
+                                captureLoadedChapter(component);
+                                // Invalidate pending reader work before releasing
+                                // its frame, including a later fonts.ready callback.
+                                component.halt();
+                                component.unprime();
+                                finish();
+                                return;
+                            }
+                        } catch (error) {
+                            finish(error);
+                            return;
+                        }
+                    }
+                    // Hidden timers may run much less often. Keep a finite
+                    // failure budget, but allow background loading more time.
+                    const limit = document.hidden ? 180000 : 30000;
+                    if (now - lastProgress >= limit) {
+                        finish(new Error(
+                            `Chapter loading timed out: ${component.id}\n` +
+                            `Stage: ${stage || "unknown"}\n` +
+                            `Tab: ${document.hidden ? "background" : "foreground"}`
+                        ));
+                        return;
+                    }
+                    timer = setTimeout(checkProgress, 1000);
+                };
 
                 const finish = (error) => {
                     if (settled) return;
@@ -910,12 +1010,7 @@
                     else resolve();
                 };
 
-                const timer = setTimeout(() => {
-                    finish(new Error(
-                        `Chapter loading timed out: ${component.id}\n` +
-                        `Stage: ${component._?.loadingStage || "unknown"}`
-                    ));
-                }, 30000);
+                timer = setTimeout(checkProgress, 1000);
 
                 try {
                     component.fetch(() => {
@@ -1466,44 +1561,10 @@
         downloadElem.innerHTML += "<br><b>Downloads complete!</b> Starting EPUB generation and download...<br>";
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        const filename = BIF.map.title.main + '.epub';
+        const filename = getArchiveFilename("epub");
 
-        // Try using File System Access API for streaming (much faster)
-        if ('showSaveFilePicker' in window) {
-            try {
-                const handle = await window.showSaveFilePicker({
-                    suggestedName: filename,
-                    types: [{
-                        description: 'EPUB eBook',
-                        accept: {'application/epub+zip': ['.epub']},
-                    }],
-                });
-
-                downloadElem.innerHTML += "Streaming EPUB file to disk...<br>";
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-
-                const writable = await handle.createWritable();
-                const zipStream = (await getDownloadZip())(files).body;
-
-                await zipStream.pipeTo(writable);
-
-                downloadElem.innerHTML += "Download complete!<br>";
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-            } catch (err) {
-                if (err.name === 'AbortError') {
-                    // User cancelled the save dialog
-                    downloadElem.innerHTML += "Download cancelled by user.<br>";
-                } else {
-                    console.error('Streaming download failed:', err);
-                    downloadElem.innerHTML += "Streaming failed, using fallback...<br>";
-                    // Fall back to blob method
-                    await fallbackBlobDownload(files, filename);
-                }
-            }
-        } else {
-            // Fall back to blob method for older browsers
-            await fallbackBlobDownload(files, filename);
-        }
+        // Browser settings control the destination and any browser-level prompt.
+        await fallbackBlobDownload(files, filename);
 
         downloadState = -1;
     }
