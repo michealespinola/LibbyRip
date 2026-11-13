@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-11-12.4
+// @version       2026-11-12.5
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -20,7 +20,11 @@
 /* =========================================
    CHANGE 00 | 2026-11-12 | UPDATE SUMMARY AND MODIFICATION INDEX
    Baseline: LibreGRAB_original.js, version 2026-10-30.
-   Current: 2026-11-12.4.
+   Current: 2026-11-12.5.
+
+   2026-11-12.5: Resolve audio URLs before building preview controls,
+   refresh them on reopening, and distinguish audio parts from chapters.
+   Normalize part indices and captured URL keys; show playback errors.
 
    2026-11-12.4: ESLint pass. Remove obsolete URL collectors,
    unused variables/helpers and unused catch/callback parameters.
@@ -60,7 +64,8 @@
    07 Captured page resources     17 Background chapter loading
    08 Image-backed page styling   18 Background audio URL collection
    09 EPUB 3 package metadata     19 Automatic saves/archive filenames
-   10 Language metadata handling  20 Lint cleanup (this revision)
+   10 Language metadata handling  20 Lint cleanup
+   21 Audio part preview controls
 
    LIMITS: Detector hashes remain a snapshot, not live discovery.
    Browser freezing/discard can still interrupt work. Background audio
@@ -68,7 +73,7 @@
    pending. Blob archive downloads can use more memory than streaming.
 
    RETAINED: Author/license, MP3 and audiobook ZIP options, metadata/cover
-   export, FFmpeg processing, and disabled upstream automatic updates.
+   export and FFmpeg processing. Automatic updates use this GitHub fork.
    END CHANGE 00
    ========================================= */
 // @author        michealespinola
@@ -235,7 +240,7 @@
         <a class="pLink" id="exp"> <h1> Export audiobook </h1> </a>
     `;
     const chaptersMenu = `
-        <h2>This book contains {CHAPTERS} chapters.</h2>
+        <h2>This book contains {CHAPTERS} audio parts.</h2>
         <button class="shibui-button" style="background-color: white" id="dumpAll"> Download all </button><br>
     `;
     let chapterMenuElem;
@@ -270,14 +275,18 @@
     }
     function getUrls(){
         let ret = [];
-        for (let spine of BIF.objects.spool.components){
-            let partFile;
-            try { partFile = decodeURIComponent(spine.meta.path); } catch { partFile = spine.meta.path; }
-            let captured = partFile ? capturedPlayerUrls.get(partFile) : null;
+        for (const [position, spine] of BIF.objects.spool.components.entries()){
+            const partFile = partKeyFromUrl(spine.meta.path);
+            const captured = partFile ? capturedPlayerUrls.get(partFile) : null;
+            const rawIndex = spine.meta["-odread-spine-position"];
+            const numericIndex = Number(rawIndex);
+            const index = rawIndex != null && rawIndex !== "" &&
+                Number.isInteger(numericIndex) && numericIndex >= 0
+                ? numericIndex : position;
             let data = {
 
                 url: captured || location.origin + "/" + spine.meta.path + "?" + (odreadCmptParams || [])[spine.spinePosition],
-                index : spine.meta["-odread-spine-position"],
+                index,
                 duration: spine.meta["audio-duration"],
                 size: spine.meta["-odread-file-bytes"],
                 type: spine.meta["media-type"]
@@ -291,51 +300,102 @@
         var pad = new Array(1 + padlen).join(pad_char);
         return (pad + num).slice(-pad.length);
     }
-    let firstChapClick = true;
-    function viewChapters(){
-        // Populate chapters ONLY after first viewing
-        if (firstChapClick){
-            firstChapClick = false;
-            for (let url of getUrls()){
-                let span = document.createElement("span");
-                span.classList.add("pChapLabel")
-                span.textContent = "#" + (1 + url.index);
-
-                let audio = document.createElement("audio");
-                audio.setAttribute("controls", "");
-                let source = document.createElement("source");
-                source.setAttribute("src", url.url);
-                source.setAttribute("type", url.type);
-                audio.appendChild(source);
-
-                chapterMenuElem.appendChild(span);
-                chapterMenuElem.appendChild(document.createElement("br"));
-                chapterMenuElem.appendChild(audio);
-                chapterMenuElem.appendChild(document.createElement("br"));
-            }
-        }
-        if (chapterMenuElem.classList.contains("active"))
+    // CHANGE 21: Resolve current URLs before creating playable audio rows.
+    // These are source-file parts, not the publisher's chapter boundaries.
+    async function viewChapters() {
+        if (chapterMenuElem.classList.contains("active")) {
             chapterMenuElem.classList.remove("active");
-        else
-            chapterMenuElem.classList.add("active");
-        chapterMenuElem.querySelector("#dumpAll").onclick = async function(){
-
-            chapterMenuElem.querySelector("#dumpAll").style.display = "none";
-
-            await Promise.all(getUrls().map(async function(url){
-                const res = await fetch(url.url);
-                const blob = await res.blob();
-
-                const link = document.createElement('a');
-                link.href = URL.createObjectURL(blob);
-                link.download = `${getAuthorString()} - ${BIF.map.title.main}.${url.index}.mp3`;
-                link.click();
-
-                URL.revokeObjectURL(link.href);
-            }));
-
-            chapterMenuElem.querySelector("#dumpAll").style.display = "";
-        };
+            chapterMenuElem.querySelectorAll("audio").forEach(audio => audio.pause());
+            return;
+        }
+        if (downloadState !== -1) return;
+        downloadState = 0;
+        chapterMenuElem.classList.add("active");
+        chapterMenuElem.replaceChildren();
+        const message = document.createElement("p");
+        message.textContent = "Resolving audio part URLs...";
+        chapterMenuElem.appendChild(message);
+        try {
+            const urls = await ensurePlayerUrls(getUrls());
+            chapterMenuElem.innerHTML = chaptersMenu.replace("{CHAPTERS}", urls.length);
+            const note = document.createElement("p");
+            note.textContent = "Audio parts may contain multiple chapters.";
+            chapterMenuElem.appendChild(note);
+            for (const part of urls) {
+                const label = document.createElement("div");
+                label.classList.add("pChapLabel");
+                label.textContent = "Part " + (part.index + 1);
+                chapterMenuElem.appendChild(label);
+                const status = document.createElement("div");
+                if (!hasWorkingUrl(part)) {
+                    status.textContent = "Audio URL unavailable. Close and reopen this panel to retry.";
+                    chapterMenuElem.appendChild(status);
+                    continue;
+                }
+                const audio = document.createElement("audio");
+                audio.controls = true;
+                audio.preload = "metadata";
+                audio.addEventListener("loadedmetadata", () => {
+                    const seconds = Math.floor(audio.duration);
+                    if (Number.isFinite(seconds) && seconds >= 0) {
+                        const hours = Math.floor(seconds / 3600);
+                        const minutes = Math.floor(seconds % 3600 / 60);
+                        const duration = (hours ? hours + ":" + paddy(minutes, 2)
+                            : String(minutes)) + ":" + paddy(seconds % 60, 2);
+                        label.textContent = "Part " + (part.index + 1) + " (" + duration + ")";
+                    }
+                    status.textContent = "";
+                });
+                audio.addEventListener("error", () => {
+                    status.textContent = "Playback failed (media error " +
+                        (audio.error?.code || "unknown") +
+                        "). Close and reopen this panel to refresh its URL.";
+                });
+                // Let the browser inspect the actual media instead of relying
+                // on potentially missing or stale metadata MIME declarations.
+                audio.src = part.url;
+                chapterMenuElem.appendChild(audio);
+                chapterMenuElem.appendChild(status);
+            }
+            const button = chapterMenuElem.querySelector("#dumpAll");
+            button.onclick = async () => {
+                if (downloadState !== -1) return;
+                downloadState = 0;
+                button.disabled = true;
+                const result = document.createElement("p");
+                chapterMenuElem.appendChild(result);
+                try {
+                    const current = await ensurePlayerUrls(getUrls());
+                    if (current.some(part => !hasWorkingUrl(part))) {
+                        throw new Error("Some audio URLs are unavailable. Reopen the panel to retry.");
+                    }
+                    await Promise.all(current.map(async part => {
+                        const response = await fetch(part.url);
+                        if (!response.ok) throw new Error(
+                            `Part ${part.index + 1}: HTTP ${response.status}`);
+                        const objectUrl = URL.createObjectURL(await response.blob());
+                        const link = document.createElement("a");
+                        link.href = objectUrl;
+                        link.download = `${getAuthorString()} - ${BIF.map.title.main}.${part.index}.mp3`;
+                        document.body.appendChild(link);
+                        link.click();
+                        link.remove();
+                        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+                    }));
+                    result.textContent = "Downloads sent to browser.";
+                } catch (error) {
+                    result.textContent = error.message || String(error);
+                } finally {
+                    button.disabled = false;
+                    downloadState = -1;
+                }
+            };
+        } catch (error) {
+            chapterMenuElem.replaceChildren(message);
+            message.textContent = error.message || String(error);
+        } finally {
+            downloadState = -1;
+        }
     }
     function getAuthorString(){
         return (Array.isArray(BIF.map.creator) ? BIF.map.creator : [])
