@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-11-12.3
+// @version       2026-11-12.4
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -13,33 +13,62 @@
 // @run-at        document-start
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
 // @grant         none
-// @downloadURL none
-// @updateURL none
+// @downloadURL https://raw.githubusercontent.com/michealespinola/LibbyRip/main/userscript.js
+// @updateURL   https://raw.githubusercontent.com/michealespinola/LibbyRip/main/userscript.js
 // ==/UserScript==
 
 /* =========================================
-   CHANGE 00 | 2026-11-11 | MODIFICATION INDEX
+   CHANGE 00 | 2026-11-12 | UPDATE SUMMARY AND MODIFICATION INDEX
    Baseline: LibreGRAB_original.js, version 2026-10-30.
-   Baseline reviewed: LibreGRAB_fixed.js, version 2026-11-11.2.
-   CHANGE 15 adds standalone frame capture in version 2026-11-11.3.
-   Earlier CHANGE notes document the preceding compatibility work.
+   Current: 2026-11-12.4.
 
-   01 Version/update policy       08 Image-backed page styling
-   02 Private ZIP loader          09 EPUB 3 package metadata
-   03 Audio-only JSON capture     10 Language metadata handling
-   04 Archive status label        11 EPUB navigation document
-   05 Private chapter storage     12 Reader callback compatibility
-   06 Sequential chapter loading  13 Visible export errors
-   07 Frame-independent page IDs  14 Per-load UI identifiers
+   2026-11-12.4: ESLint pass. Remove obsolete URL collectors,
+   unused variables/helpers and unused catch/callback parameters.
+   Replace control-character regex matching with character-code checks
+   while preserving Windows-safe filenames. No export-flow redesign.
 
-   CURRENT DESIGN: CHANGE 15 supersedes the callback override.
-   Chapters are copied from loaded frames before the reader releases
-   them. No theme.js override or disabled downfall is required.
-   The detector hash list is currently a snapshot, not live discovery.
+   2026-11-12.3: Use browser downloads for ZIP and EPUB without a script
+   save picker. Name both archives "Author - Title.ext", sanitize Windows
+   filename characters, and provide missing-author/title defaults.
+   Chrome's download settings still control destination and prompts.
 
-   RETAINED: Original author/license, audiobook MP3 and ZIP options,
-   metadata/cover export, player URL capture, and FFmpeg processing.
-   Existing BEGIN/END section headings are preserved.
+   2026-11-12.2: Collect audiobook URLs from resource entries and assigned
+   media sources, including detached audio elements. Observe new entries,
+   retry missing parts up to three times with elapsed-time deadlines,
+   report incomplete collection, and restore the playback position.
+
+   2026-11-12.1: Add a hidden-tab ebook fallback for complete, healthy
+   chapters waiting on fonts.ready. Allow 180 seconds without loading
+   stage progress while hidden, or 30 seconds while visible. Invalidate
+   pending reader work before releasing a fallback-captured frame.
+
+   2026-11-11.3-.4: Capture loaded chapter frames without callback
+   replacement, DevTools, or Local Overrides. Preserve captured base URLs
+   and stylesheet references. Accept data-document-status="ok".
+
+   Earlier compatibility changes: sequential chapter loading, private
+   state/ZIP initialization, per-load UI names, audio-only JSON capture,
+   fixed-page image/text-overlay styling, EPUB 3 metadata/navigation,
+   complete language codes, and visible export errors.
+
+   01 Version/update policy       11 EPUB navigation document
+   02 Private ZIP loader          12 Ebook initialization
+   03 Audio-only JSON capture     13 Visible export errors
+   04 Archive status label        14 Per-load UI identifiers
+   05 Private chapter storage     15 Standalone frame capture
+   06 Sequential chapter loading  16 Successful document status
+   07 Captured page resources     17 Background chapter loading
+   08 Image-backed page styling   18 Background audio URL collection
+   09 EPUB 3 package metadata     19 Automatic saves/archive filenames
+   10 Language metadata handling  20 Lint cleanup (this revision)
+
+   LIMITS: Detector hashes remain a snapshot, not live discovery.
+   Browser freezing/discard can still interrupt work. Background audio
+   has passed initial user testing; background ebook verification remains
+   pending. Blob archive downloads can use more memory than streaming.
+
+   RETAINED: Author/license, MP3 and audiobook ZIP options, metadata/cover
+   export, FFmpeg processing, and disabled upstream automatic updates.
    END CHANGE 00
    ========================================= */
 // @author        michealespinola
@@ -198,34 +227,8 @@
     let capturedPlayerUrls = new Map();
     function partKeyFromUrl(u){
         try { return decodeURIComponent(new URL(u, location.href).pathname.split("/").pop()); }
-        catch (e) { return null; }
+        catch { return null; }
     }
-    function recordPlayerUrl(u){
-        try {
-            if (typeof u !== "string" || u.indexOf(".mp3") === -1) return;
-            let key = partKeyFromUrl(u);
-            if (key && !capturedPlayerUrls.has(key)) {
-                capturedPlayerUrls.set(key, u);
-                console.log("[LibreGRAB] Captured player URL for " + key);
-            }
-        } catch (e) {}
-    }
-    // No HTMLMediaElement src/setAttribute patch: patching media prototypes
-    // is a suspected detection vector (OverDrive navigates to terms when it
-    // detects tampering), and capture via mergePerformanceMediaUrls()
-    // (performance entries) alone proved sufficient for every part.
-    function mergePerformanceMediaUrls(){
-        try {
-            let entries = performance.getEntriesByType("resource") || [];
-            for (let i = 0; i < entries.length; i++) {
-                let en = entries[i];
-                if ((en.initiatorType === "audio" || en.initiatorType === "media") && en.name) recordPlayerUrl(en.name);
-            }
-        } catch (e) {}
-    }
-
-
-
     const audioBookNav = `
         <a class="pLink" id="chap"> <h1> View chapters </h1> </a>
         <a class="pLink" id="down"> <h1> Export as MP3 </h1> </a>
@@ -268,8 +271,8 @@
     function getUrls(){
         let ret = [];
         for (let spine of BIF.objects.spool.components){
-            let partFile = null;
-            try { partFile = decodeURIComponent(spine.meta.path); } catch (e) { partFile = spine.meta.path; }
+            let partFile;
+            try { partFile = decodeURIComponent(spine.meta.path); } catch { partFile = spine.meta.path; }
             let captured = partFile ? capturedPlayerUrls.get(partFile) : null;
             let data = {
 
@@ -344,8 +347,9 @@
     function getArchiveFilename(extension) {
         const author = getAuthorString().trim() || "Unknown author";
         const title = String(BIF.map.title?.main || "Untitled").trim() || "Untitled";
-        const name = (author + " - " + title)
-            .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+        const name = Array.from(author + " - " + title, character =>
+            character.charCodeAt(0) < 32 ? "_" : character).join("")
+            .replace(/[<>:"/\\|?*]/g, "_")
             .replace(/[. ]+$/, "");
         return name + "." + extension;
     }
@@ -589,7 +593,7 @@
                     !hasWorkingUrl({url: url.href})) return;
                 // Replace stale entries with the player's latest assigned URL.
                 capturedPlayerUrls.set(partKeyFromUrl(url.href), url.href);
-            } catch (error) { /* Not a usable media URL. */ }
+            } catch { /* Not a usable media URL. */ }
         }
         function collectResources(entries) {
             for (const entry of entries) collectUrl(entry.name);
@@ -624,7 +628,7 @@
                             queue.push({value: child, depth: depth + 1});
                         }
                     }
-                } catch (error) { /* An inaccessible reader object is optional. */ }
+                } catch { /* An inaccessible reader object is optional. */ }
             }
         }
         function collect() {
@@ -646,7 +650,7 @@
                     observer = new PerformanceObserver(list =>
                         collectResources(list.getEntries()));
                     observer.observe({type: "resource", buffered: true});
-                } catch (error) { observer?.disconnect(); }
+                } catch { observer?.disconnect(); }
             }
             for (let attempt = 1; attempt <= 3; attempt++) {
                 const missing = collect().filter(item => !hasWorkingUrl(item));
@@ -682,7 +686,7 @@
             try {
                 const back = compass.at({floc: origFloc});
                 if (back && typeof back.seek === "function") back.seek();
-            } catch (error) { /* Do not mask the export result. */ }
+            } catch { /* Do not mask the export result. */ }
         }
         return urls;
     }
@@ -701,7 +705,7 @@
                 downloadState = -1;
                 return;
             }
-            createAndDownloadMp3(urls).then((p)=>{});
+            createAndDownloadMp3(urls).then(()=>{});
         }).catch(function(err){
             downloadElem.innerHTML += "<b>Error:</b> " + err.message + "<br>";
             downloadState = -1;
@@ -801,7 +805,7 @@
                 return;
             }
             downloadElem.innerHTML += "Downloading...<br>";
-            createAndDownloadZip(urls, true).then((p)=>{});
+            createAndDownloadZip(urls, true).then(()=>{});
         }).catch(function(err){
             downloadElem.innerHTML += "<b>Error:</b> " + err.message + "<br>";
             downloadState = -1;
@@ -863,7 +867,8 @@
        chapter, then polled forever and repeatedly logged missing counts.
        Now: Skip captured chapters; halt stale work, fetch one chapter,
        copy the loaded frame before release, then advance to the next.
-       Added: A 30-second timeout per chapter and explicit failure paths.
+       Added: Progress-based timeouts (30 seconds visible, 180 hidden)
+       and explicit failure paths; see CHANGE 17.
        Why: Avoid invalid work-token failures and indefinite waiting.
        Limit: halt/fetch still use reader internals. Avoid navigating
        the reader during export, as navigation can start competing work.
@@ -878,7 +883,7 @@
        Existing loaded frames are copied without forcing another load.
        Only cloned markup is sanitized; the live reader is not edited.
        Limits: Needs a readable same-origin frame and the current
-       component fetch() lifecycle. This is not yet live-browser tested.
+       component fetch() lifecycle. Background verification remains pending.
        ========================================= */
     const pageResources = Object.create(null);
     function captureLoadedChapter(component) {
@@ -1036,14 +1041,6 @@
     function truncate(path){
         return path.substring(path.lastIndexOf('/') + 1);
     }
-    function goOneLevelUp(url) {
-        let u = new URL(url);
-        if (u.pathname === "/") return url; // Already at root
-
-
-        u.pathname = u.pathname.replace(/\/[^/]*\/?$/, "/");
-        return u.toString();
-    }
     function getFilenameFromURL(url) {
         const parsedUrl = new URL(url);
         const pathname = parsedUrl.pathname;
@@ -1051,7 +1048,6 @@
     }
     async function createContent(files, imgAssests){
 
-        let cssRegistry = {};
 
         let components = getBookComponents();
         let totComp = components.length;
@@ -1669,7 +1665,7 @@
             clearInterval(intr);
             BIF = window.BIF;
             bifFoundAudiobook();
-        } catch (e) { __pbarCount = -1; __stablePolls = 0; }
+        } catch { __pbarCount = -1; __stablePolls = 0; }
     }, 500);
     }
 
