@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-11-12.5
+// @version       2026-11-12.6
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -20,7 +20,11 @@
 /* =========================================
    CHANGE 00 | 2026-11-12 | UPDATE SUMMARY AND MODIFICATION INDEX
    Baseline: LibreGRAB_original.js, version 2026-10-30.
-   Current: 2026-11-12.5.
+   Current: 2026-11-12.6.
+
+   2026-11-12.6: Add explicit Download Part buttons and share descriptive
+   "Author - Title Part ###.mp3" naming with Download All. Preserve ZIP
+   entry names. Hide the native media download menu where supported.
 
    2026-11-12.5: Resolve audio URLs before building preview controls,
    refresh them on reopening, and distinguish audio parts from chapters.
@@ -66,6 +70,7 @@
    09 EPUB 3 package metadata     19 Automatic saves/archive filenames
    10 Language metadata handling  20 Lint cleanup
    21 Audio part preview controls
+   22 Descriptive individual part downloads
 
    LIMITS: Detector hashes remain a snapshot, not live discovery.
    Browser freezing/discard can still interrupt work. Background audio
@@ -334,6 +339,7 @@
                 }
                 const audio = document.createElement("audio");
                 audio.controls = true;
+                audio.setAttribute("controlsList", "nodownload");
                 audio.preload = "metadata";
                 audio.addEventListener("loadedmetadata", () => {
                     const seconds = Math.floor(audio.duration);
@@ -355,6 +361,31 @@
                 // on potentially missing or stale metadata MIME declarations.
                 audio.src = part.url;
                 chapterMenuElem.appendChild(audio);
+                const partButton = document.createElement("button");
+                partButton.type = "button";
+                partButton.classList.add("shibui-button");
+                partButton.textContent = "Download Part " + String(part.index + 1).padStart(3, "0");
+                const downloadStatus = document.createElement("div");
+                partButton.onclick = async () => {
+                    if (downloadState !== -1) return;
+                    downloadState = 0;
+                    partButton.disabled = true;
+                    downloadStatus.textContent = "Downloading...";
+                    try {
+                        // Prefer the latest captured URL if another export
+                        // refreshed it after this panel was opened.
+                        const current = getUrls().find(item => item.index === part.index);
+                        await downloadAudioPart(hasWorkingUrl(current) ? current : part);
+                        downloadStatus.textContent = "Download sent to browser.";
+                    } catch (error) {
+                        downloadStatus.textContent = error.message || String(error);
+                    } finally {
+                        partButton.disabled = false;
+                        downloadState = -1;
+                    }
+                };
+                chapterMenuElem.appendChild(partButton);
+                chapterMenuElem.appendChild(downloadStatus);
                 chapterMenuElem.appendChild(status);
             }
             const button = chapterMenuElem.querySelector("#dumpAll");
@@ -369,19 +400,12 @@
                     if (current.some(part => !hasWorkingUrl(part))) {
                         throw new Error("Some audio URLs are unavailable. Reopen the panel to retry.");
                     }
-                    await Promise.all(current.map(async part => {
-                        const response = await fetch(part.url);
-                        if (!response.ok) throw new Error(
-                            `Part ${part.index + 1}: HTTP ${response.status}`);
-                        const objectUrl = URL.createObjectURL(await response.blob());
-                        const link = document.createElement("a");
-                        link.href = objectUrl;
-                        link.download = `${getAuthorString()} - ${BIF.map.title.main}.${part.index}.mp3`;
-                        document.body.appendChild(link);
-                        link.click();
-                        link.remove();
-                        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-                    }));
+                    // Wait for all downloads, including failures, before
+                    // releasing the export lock or re-enabling the button.
+                    const results = await Promise.allSettled(current.map(downloadAudioPart));
+                    const failures = results.filter(item => item.status === "rejected");
+                    if (failures.length) throw new Error(failures.map(item =>
+                        item.reason?.message || String(item.reason)).join("; "));
                     result.textContent = "Downloads sent to browser.";
                 } catch (error) {
                     result.textContent = error.message || String(error);
@@ -412,6 +436,36 @@
             .replace(/[<>:"/\\|?*]/g, "_")
             .replace(/[. ]+$/, "");
         return name + "." + extension;
+    }
+
+    // CHANGE 22: Shared naming/download path for individual and bulk parts.
+    // ZIP export intentionally retains its existing Part ###.mp3 entries.
+    function getAudioPartFilename(part) {
+        const index = Number(part.index);
+        if (!Number.isSafeInteger(index) || index < 0) {
+            throw new Error("Invalid audio part number");
+        }
+        const base = getArchiveFilename("mp3").slice(0, -4);
+        return `${base} Part ${String(index + 1).padStart(3, "0")}.mp3`;
+    }
+
+    async function downloadAudioPart(part) {
+        const filename = getAudioPartFilename(part);
+        if (!hasWorkingUrl(part)) throw new Error(`Part ${Number(part.index) + 1}: URL unavailable`);
+        const response = await fetch(part.url);
+        if (!response.ok) throw new Error(
+            `Part ${Number(part.index) + 1}: HTTP ${response.status}`);
+        const objectUrl = URL.createObjectURL(await response.blob());
+        const link = document.createElement("a");
+        try {
+            link.href = objectUrl;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+        } finally {
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+        }
     }
 
     function getMetadata(){
